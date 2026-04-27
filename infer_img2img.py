@@ -4,13 +4,13 @@ import numpy as np
 from PIL import Image, ImageOps
 import PIL
 from diffusers.models import ControlNetModel, UNet2DConditionModel
-from diffusers import DPMSolverMultistepScheduler
+from diffusers import DPMSolverMultistepScheduler, DPMSolverSinglestepScheduler
 from safetensors.torch import load_file
 import math
 import os
 import glob
 from insightface.app import FaceAnalysis
-from pipeline_stable_diffusion_xl_instantid import StableDiffusionXLInstantIDPipeline
+from pipeline_stable_diffusion_xl_instantid_img2img import StableDiffusionXLInstantIDImg2ImgPipeline
 from evaclip import EVACLIP
 
 def draw_kps(image_pil, kps, color_list=[(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255)]):
@@ -79,16 +79,18 @@ def get_face_info(app, image):
         return
     
     face = sorted(faces, key=lambda x:(x['bbox'][2]-x['bbox'][0])*x['bbox'][3]-x['bbox'][1])[-1] # only use the maximum face
-    return face.embedding, face.kps, face.bbox
+    return face
     
 
-def get_prompt_list():
-    prompt_list = []
-    prompt_list.append('analog film photo of a man. faded film, desaturated, 35mm photo, grainy, vignette, vintage, Kodachrome, Lomography, stained, highly detailed, found footage, masterpiece, best quality')
-    prompt_list.append('1man, solo, in the center, (detailed eyes), (detailed face), (looking_at_viewer), simple_background, high definition, sharp focus, real photo, captivating portrait')
-    prompt_list.append('1man, solo, in the center, (detailed eyes), (detailed face), (looking_at_viewer), on the steet, sunlight, high definition, sharp focus, real photo, captivating portrait')
-    prompt_list.append('1man, solo, in the center, (detailed eyes), (detailed face), (looking_at_viewer), indoor, in the bedroom, high definition, sharp focus, real photo, captivating portrait')
-    return prompt_list
+def get_image_list(path):
+    image_path_list = glob.glob(os.path.join(path, '*.*'))
+    image_list = []
+    for image_path in image_path_list:
+        image = Image.open(image_path).convert('RGB')
+        image = ImageOps.exif_transpose(image)
+        image = resize_img(image)
+        image_list.append(image)
+    return image_list
 
 def get_checkpoint_path(path, index=-1):
     path_list = glob.glob(os.path.join(path, 'checkpoint-*'))
@@ -101,9 +103,9 @@ def get_model_version(path):
     return version
 
 if __name__ == "__main__":
-    hf_home = '/apdcephfs_cq8/share_1367250/francofhzhu/huggingface'
+    hf_home = '~/huggingface'
     pretrained_root = "./checkpoints"
-    trained_root = "./InstantID_output/v5"
+    trained_root = "./InstantID_output/v1"
     checkpoint_path = get_checkpoint_path(trained_root, -1)
     model_root = checkpoint_path
     model_version = get_model_version(model_root)
@@ -122,52 +124,58 @@ if __name__ == "__main__":
     # base_model_path = 'stabilityai/stable-diffusion-xl-base-1.0'
     base_model_path = os.path.join(hf_home, "hub/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots/462165984030d82259a11f4367a4eed129e94a7b")
 
-    unet = UNet2DConditionModel.from_config(base_model_path, subfolder='unet').to(torch.float16)
-    unet.load_state_dict(load_file(os.path.join(pretrained_root, 'sdxl_lightning_8step_unet.safetensors')))
+    # unet = UNet2DConditionModel.from_config(base_model_path, subfolder='unet').to(torch.float16)
+    # unet.load_state_dict(load_file(os.path.join(pretrained_root, 'sdxl_lightning_8step_unet.safetensors')))
 
-    pipe = StableDiffusionXLInstantIDPipeline.from_pretrained(
+    pipe = StableDiffusionXLInstantIDImg2ImgPipeline.from_pretrained(
         base_model_path,
-        unet=unet,
+        # unet=unet,
         controlnet=controlnet,
         torch_dtype=torch.float16,
     )
-    pipe.scheduler = DPMSolverMultistepScheduler.from_config(
-        pipe.scheduler.config, timestep_spacing="trailing"
+    pipe.scheduler = DPMSolverSinglestepScheduler.from_config(
+        pipe.scheduler.config, timestep_spacing="trailing", use_karras_sigmas=True
     )
     pipe.cuda()
     pipe.load_ip_adapter_instantid(face_adapter)
 
     print("#" * 30, model_version, "#" * 30)
 
-    prompt_list = get_prompt_list()
+    prompt = "1man, solo, in the center, (detailed eyes), (detailed face), (looking_at_viewer), high definition, sharp focus, real photo, captivating portrait"
     n_prompt = "(worst quality, low quality, bad_pictures), blurry, lowres, bad anatomy, naked, nude, nipples, vagina, glans, ugly, pregnant, vore, duplicate, morbid,mut ilated, tran nsexual, hermaphrodite, long neck"
     in_path = './examples/images'
-    out_path = './examples/outputs'
+    temp_path = './examples/inputs'
+    out_path = './examples/outputs_i2i'
+    image_list = get_image_list(temp_path)
     seed = 42
     for image_path in glob.glob(os.path.join(in_path, '*')):
         image_name = os.path.basename(image_path).split('.')[0]
         image = Image.open(image_path).convert('RGB')
         image = ImageOps.exif_transpose(image)
         image = resize_img(image)
-        face_emb, face_kps, face_bbox = get_face_info(app, image)
-        face_kps = draw_kps(image, face_kps)
+        face = get_face_info(app, image)
+        face_emb, face_bbox = face.embedding, face.bbox
         image_face = image.crop(face_bbox)
         clip_info = evaclip_model.predict(image_face)
         clip_emb, clip_hidden = clip_info['clip_emb'], clip_info['clip_hidden']
 
         pipe.set_ip_adapter_scale(0.8)
         print(image_name)
-        for i, prompt in enumerate(prompt_list):
+        for i, temp_image in enumerate(image_list):
+            face_temp = get_face_info(app, temp_image)
+            face_kps = draw_kps(temp_image, face_temp.kps)
             image = pipe(
+                image=temp_image,
                 prompt=prompt,
                 negative_prompt=n_prompt,
                 image_embeds=face_emb,
                 evaclip_embeds=clip_emb,
                 evaclip_hiddens=clip_hidden,
-                image=face_kps,
-                controlnet_conditioning_scale=0.8,
-                num_inference_steps=8,
-                guidance_scale=1.5,
+                control_image=face_kps,
+                controlnet_conditioning_scale=0.4,
+                num_inference_steps=30,
+                strength=0.6,
+                guidance_scale=5,
                 generator=torch.Generator(device="cpu").manual_seed(seed),
             ).images[0]
             save_path = f'{model_version}-{image_name}_{i}.png'

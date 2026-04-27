@@ -3,6 +3,39 @@ import math
 
 import torch
 import torch.nn as nn
+from diffusers.models.embeddings import TimestepEmbedding, Timesteps
+
+
+class AdaLayerNorm(nn.Module):
+    def __init__(self, embedding_dim: int, time_embedding_dim: int):
+        super().__init__()
+
+        if time_embedding_dim is None:
+            time_embedding_dim = embedding_dim
+
+        self.gelu = nn.GELU()
+        self.linear = nn.Linear(time_embedding_dim, 2 * embedding_dim, bias=True)
+        nn.init.zeros_(self.linear.weight)
+        nn.init.zeros_(self.linear.bias)
+
+        self.norm = nn.LayerNorm(embedding_dim, elementwise_affine=False, eps=1e-6)
+
+    def forward(self, x: torch.Tensor, timestep_embedding: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        emb = self.linear(self.gelu(timestep_embedding))
+        shift, scale = emb.view(len(x), 1, -1).chunk(2, dim=-1)
+        x = self.norm(x) * (1 + scale) + shift
+        return x
+
+
+# process multiple inputs
+class Sequential(nn.Sequential):
+    def forward(self, *inputs):
+        for module in self._modules.values():
+            if type(inputs) == tuple:
+                inputs = module(*inputs)
+            else:
+                inputs = module(inputs)
+        return inputs
 
 
 # FFN
@@ -78,12 +111,16 @@ class PerceiverAttention(nn.Module):
 class Resampler(nn.Module):
     def __init__(
         self,
-        dim=1024,
-        depth=8,
+        dim=1280,
+        time_channel=320,
+        time_embed_dim=1280,
+        depth=4,
         dim_head=64,
-        heads=16,
-        num_queries=8,
-        embedding_dim=768,
+        heads=20,
+        num_queries=16,
+        embedding_dim=512,
+        embedding_dim2=768,
+        embedding_hidden=1024,
         output_dim=1024,
         ff_mult=4,
     ):
@@ -92,9 +129,22 @@ class Resampler(nn.Module):
         self.latents = nn.Parameter(torch.randn(1, num_queries, dim) / dim**0.5)
         
         self.proj_in = nn.Linear(embedding_dim, dim)
-
+        self.proj_in2 = nn.Linear(embedding_dim2, dim)
+        for i in range(4):
+            setattr(
+                self, f'proj_hidden{i}', nn.Linear(embedding_hidden, dim)
+            )
+        self.time_aware_linear = nn.Linear(time_embed_dim, dim, bias=True)
         self.proj_out = nn.Linear(dim, output_dim)
         self.norm_out = nn.LayerNorm(output_dim)
+
+        self.position = Timesteps(time_channel, flip_sin_to_cos=True, downscale_freq_shift=0)
+        self.time_embedding = TimestepEmbedding(
+            in_channels=time_channel,
+            time_embed_dim=time_embed_dim,
+            act_fn='gelu',
+            out_dim=None,
+        )
         
         self.layers = nn.ModuleList([])
         for _ in range(depth):
@@ -102,20 +152,36 @@ class Resampler(nn.Module):
                 nn.ModuleList(
                     [
                         PerceiverAttention(dim=dim, dim_head=dim_head, heads=heads),
+                        nn.Linear(time_embed_dim, dim, bias=True),
                         FeedForward(dim=dim, mult=ff_mult),
+                        nn.Linear(time_embed_dim, dim, bias=True),
                     ]
                 )
             )
 
-    def forward(self, x):
+    def forward(self, x, x2, hiddens, timesteps):
         
         latents = self.latents.repeat(x.size(0), 1, 1)
         
-        x = self.proj_in(x)
-        
-        for attn, ff in self.layers:
-            latents = attn(x, latents) + latents
+        conds = []
+        conds.append(self.proj_in(x))
+        conds.append(self.proj_in2(x2))
+        for i in range(4):
+            conds.append(getattr(self, f'proj_hidden{i}')(hiddens[:, [i]]))
+        conds = torch.cat(conds, dim=1)
+
+        ori_time_feature = self.position(timesteps.view(-1)).to(dtype=x.dtype)
+        ori_time_feature = ori_time_feature.unsqueeze(dim=1) if ori_time_feature.ndim == 2 else ori_time_feature
+        ori_time_feature = ori_time_feature.expand(x.size(0), -1, -1)
+        timestep_embedding = self.time_embedding(ori_time_feature)
+
+        latents = latents + self.time_aware_linear(torch.nn.functional.gelu(timestep_embedding))
+
+        for attn, te_attn, ff, te_ff in self.layers:
+            latents = attn(conds, latents) + latents
+            latents = te_attn(torch.nn.functional.gelu(timestep_embedding)) + latents
             latents = ff(latents) + latents
+            latents = te_ff(torch.nn.functional.gelu(timestep_embedding)) + latents
             
         latents = self.proj_out(latents)
         return self.norm_out(latents)
